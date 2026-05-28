@@ -538,12 +538,37 @@ static bool LoadTextureFromFileW(
     return ok;
 }
 
+static std::wstring GetExeDirectory()
+{
+    wchar_t path[MAX_PATH];
+
+    DWORD length = GetModuleFileNameW(
+        nullptr,
+        path,
+        MAX_PATH
+    );
+
+    if (length == 0 || length == MAX_PATH)
+        return L"";
+
+    std::wstring exePath(path);
+
+    size_t lastSlash = exePath.find_last_of(L"\\/");
+
+    if (lastSlash == std::wstring::npos)
+        return L"";
+
+    return exePath.substr(0, lastSlash + 1);
+}
+
 static void LoadPuzzleTexture()
 {
     ReleasePuzzleTexture();
 
+    std::wstring imagePath = GetExeDirectory() + L"puzzlebox.png";
+
     if (LoadTextureFromFileW(
-        L"puzzlebox.png",
+        imagePath.c_str(),
         &g_PuzzleTexture,
         &g_PuzzleImageWidth,
         &g_PuzzleImageHeight))
@@ -552,7 +577,8 @@ static void LoadPuzzleTexture()
     }
     else
     {
-        AppendLog("Puzzle image NOT loaded. Expected file: puzzlebox.png");
+        AppendLog("Puzzle image NOT loaded.");
+        AppendLog("Expected file next to exe: puzzlebox.png");
     }
 }
 
