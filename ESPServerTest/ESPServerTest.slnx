@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="ESPServerTest/ESPServerTest.vcxproj" Id="7904be34-4037-4168-aa3e-3845c614848e" />
+</Solution>
