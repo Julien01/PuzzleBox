@@ -2,10 +2,8 @@
 .vs/
 *.ipch
 ipch/
-x64/
 x86/
 Debug/
-Release/
 *.user
 *.suo
 *.VC.db
