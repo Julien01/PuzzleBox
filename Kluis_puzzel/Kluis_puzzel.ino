@@ -7,8 +7,8 @@
 #define SLAVE_ADDR 11
 #define START_CODE 60
 
-#define SDA_PIN 21
-#define SCL_PIN 22
+#define SDA_PIN 26
+#define SCL_PIN 27
 
 volatile int lastReceived = 0;
 volatile bool puzzleStarted = false;
@@ -17,12 +17,33 @@ volatile bool victory = false;
 // -------------------------
 // PINNEN
 // -------------------------
-const byte colPins[3] = {27, 26, 25};
-const byte rowPins[4] = {32, 33, 4, 5};
+
+// Keypad kolommen = INPUTS
+// Volgens jouw schema:
+// Kolom_1 = GPIO34
+// Kolom_2 = GPIO35
+// Kolom_3 = GPIO32
+const byte colPins[3] = {34, 35, 32};
+
+// Keypad rijen = OUTPUTS
+// Volgens jouw schema:
+// Rij_1 = GPIO25
+// Rij_2 = GPIO21
+// Rij_3 = GPIO22
+// Rij_4 = GPIO23
+const byte rowPins[4] = {25, 21, 22, 23};
 
 const byte TM_CLK = 18;
 const byte TM_DIO = 19;
-const byte unlockPin = 23;
+
+// Volgens jouw schema: Kluis_slot = GPIO33
+const byte SOLENOID_PIN = 33;
+
+// Solenoid maximaal 2 seconden open
+const unsigned long SOLENOID_OPEN_TIME = 2000;
+
+bool solenoidActive = false;
+unsigned long solenoidStartTime = 0;
 
 TM1637Display display(TM_CLK, TM_DIO);
 
@@ -63,14 +84,43 @@ const byte MAX_LEVEL = 5;
 byte level = 1;
 bool gameFinished = false;
 
-// huidige opdracht
-byte currentDiagram = 0;   // 0..8
-byte currentRow = 0;       // 0..3
-byte currentCol = 0;       // 0..2
+byte currentDiagram = 0;
+byte currentRow = 0;
+byte currentCol = 0;
 char expectedKey = '\0';
 
-// flags om buiten interrupt te printen
 bool startMessagePending = false;
+
+// -------------------------
+// SOLENOID FUNCTIES
+// -------------------------
+void stopSolenoid() {
+  digitalWrite(SOLENOID_PIN, LOW);
+  solenoidActive = false;
+}
+
+void startSolenoid() {
+  if (solenoidActive) {
+    return;
+  }
+
+  digitalWrite(SOLENOID_PIN, HIGH);
+  solenoidActive = true;
+  solenoidStartTime = millis();
+
+  Serial.println("Solenoid AAN. Kluis open voor maximaal 2 seconden.");
+}
+
+void updateSolenoid() {
+  if (!solenoidActive) {
+    return;
+  }
+
+  if (millis() - solenoidStartTime >= SOLENOID_OPEN_TIME) {
+    stopSolenoid();
+    Serial.println("Solenoid UIT. Kluis weer dicht.");
+  }
+}
 
 // -------------------------
 // DISPLAY HULPFUNCTIES
@@ -110,6 +160,7 @@ void show4Chars(char a, char b, char c, char d) {
     encodeChar(c),
     encodeChar(d)
   };
+
   display.setSegments(segs);
 }
 
@@ -131,11 +182,12 @@ void showWrong() {
 
 void showOpen() {
   uint8_t segs[4] = {
-    display.encodeDigit(0),
-    0x73, // P
-    0x79, // E
-    0x54  // n benadering
+    display.encodeDigit(0), // O lijkt op 0
+    0x73,                  // P
+    0x79,                  // E
+    0x54                   // n
   };
+
   display.setSegments(segs);
 }
 
@@ -147,19 +199,24 @@ void showWaiting() {
 // KEYPAD LEZEN
 // -------------------------
 char readKeypadOnce() {
-  for (byte c = 0; c < 3; c++) {
-    for (byte i = 0; i < 3; i++) {
-      digitalWrite(colPins[i], HIGH);
-    }
+  // Zet alle rijen LOW
+  for (byte r = 0; r < 4; r++) {
+    digitalWrite(rowPins[r], LOW);
+  }
 
-    digitalWrite(colPins[c], LOW);
+  // Scan rij voor rij
+  for (byte r = 0; r < 4; r++) {
+    digitalWrite(rowPins[r], HIGH);
     delayMicroseconds(200);
 
-    for (byte r = 0; r < 4; r++) {
-      if (digitalRead(rowPins[r]) == LOW) {
+    for (byte c = 0; c < 3; c++) {
+      if (digitalRead(colPins[c]) == HIGH) {
+        digitalWrite(rowPins[r], LOW);
         return keyMap[r][c];
       }
     }
+
+    digitalWrite(rowPins[r], LOW);
   }
 
   return '\0';
@@ -170,6 +227,7 @@ char waitForStableKeypress() {
   if (k1 == '\0') return '\0';
 
   delay(25);
+
   char k2 = readKeypadOnce();
 
   if (k1 == k2) return k1;
@@ -178,6 +236,7 @@ char waitForStableKeypress() {
 
 void waitUntilReleased() {
   while (readKeypadOnce() != '\0') {
+    updateSolenoid();
     delay(10);
   }
 }
@@ -210,8 +269,10 @@ void generateNewChallenge() {
 // -------------------------
 void resetToLevel1() {
   level = 1;
+
   showWrong();
   delay(700);
+
   generateNewChallenge();
 }
 
@@ -222,9 +283,13 @@ void handleCorrect() {
   if (level >= MAX_LEVEL) {
     gameFinished = true;
     victory = true;
-    digitalWrite(unlockPin, HIGH);
+
+    stopSolenoid();
     showOpen();
-    Serial.println("Laatste level gehaald. Luik open.");
+
+    Serial.println("Laatste level gehaald.");
+    Serial.println("Display toont OPEN.");
+    Serial.println("Druk op knop 1 om de solenoid maximaal 2 seconden te openen.");
   } else {
     level++;
     generateNewChallenge();
@@ -248,6 +313,28 @@ void handleKey(char pressedKey) {
 }
 
 // -------------------------
+// EINDSTATUS
+// -------------------------
+void handleFinishedKeypad() {
+  char key = waitForStableKeypress();
+
+  if (key != '\0') {
+    Serial.print("Eindstatus toets gedrukt: ");
+    Serial.println(key);
+
+    // AANGEPAST:
+    // Eerst was dit key == '0'.
+    // Nu opent knop 1 de solenoid.
+    if (key == '1') {
+      startSolenoid();
+    }
+
+    waitUntilReleased();
+    delay(50);
+  }
+}
+
+// -------------------------
 // I2C CALLBACKS
 // -------------------------
 void receiveEvent(int bytes) {
@@ -259,7 +346,9 @@ void receiveEvent(int bytes) {
       victory = false;
       gameFinished = false;
       level = 1;
-      digitalWrite(unlockPin, LOW);
+
+      stopSolenoid();
+
       startMessagePending = true;
     }
   }
@@ -285,17 +374,22 @@ void setup() {
 
   display.setBrightness(7, true);
 
+  // Kolommen zijn inputs.
+  // GPIO34 en GPIO35 hebben geen interne pullup/pulldown.
+  // In jouw schema zitten externe 10k pulldowns, dus INPUT is goed.
   for (byte c = 0; c < 3; c++) {
-    pinMode(colPins[c], OUTPUT);
-    digitalWrite(colPins[c], HIGH);
+    pinMode(colPins[c], INPUT);
   }
 
+  // Rijen zijn outputs.
+  // Normaal LOW.
   for (byte r = 0; r < 4; r++) {
-    pinMode(rowPins[r], INPUT_PULLUP);
+    pinMode(rowPins[r], OUTPUT);
+    digitalWrite(rowPins[r], LOW);
   }
 
-  pinMode(unlockPin, OUTPUT);
-  digitalWrite(unlockPin, LOW);
+  pinMode(SOLENOID_PIN, OUTPUT);
+  digitalWrite(SOLENOID_PIN, LOW);
 
   showWaiting();
 
@@ -313,11 +407,15 @@ void setup() {
 // LOOP
 // -------------------------
 void loop() {
-  
+  updateSolenoid();
+
   if (startMessagePending) {
     startMessagePending = false;
+
     Serial.println("START RECEIVED");
     Serial.println("Start spel.");
+
+    stopSolenoid();
     generateNewChallenge();
   }
 
@@ -327,7 +425,9 @@ void loop() {
   }
 
   if (gameFinished) {
-    delay(100);
+    showOpen();
+    handleFinishedKeypad();
+    delay(20);
     return;
   }
 

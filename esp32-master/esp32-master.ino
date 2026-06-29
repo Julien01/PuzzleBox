@@ -36,7 +36,7 @@ bool allPuzzlesComplete = false;
 // ---------------- LED STRIPS ----------------
 // LET OP: GPIO34 is op veel ESP32 boards input-only.
 // Als de LEDs niet werken, gebruik bijvoorbeeld pin 4, 5, 18, 23, 25, 26, 27, 32 of 33.
-#define LED_PIN 25
+#define LED_PIN 19
 
 static const int LEDS_PER_STRIP = 13;
 static const int STRIP_COUNT = 4;
