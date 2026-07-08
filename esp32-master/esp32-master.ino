@@ -3,10 +3,12 @@
 #include <Wire.h>
 #include <esp_wifi.h>
 #include <Adafruit_NeoPixel.h>
+#include <ESP32Servo.h>
+#include "audio.h"
 
 // ---------------- WIFI / GUI ----------------
 const char* ssid = "iPhone van Bas";
-const char* password = "sigmaboys";
+const char* password = "wachtwoord";
 
 static const uint16_t UDP_DISCOVERY_PORT = 4444;
 static const uint16_t TCP_SERVER_PORT = 3333;
@@ -27,6 +29,54 @@ const uint8_t START_CODES[4] = {42, 48, 54, 60};
 
 // Kluis zit op slave-adres 11
 static const uint8_t VAULT_SLAVE_ADDR = 11;
+
+// ---------------- AUDIO / BUZZER ----------------
+// Puzzelmodules kunnen via I2C een audio-request sturen.
+// De main-module speelt het geluid af op deze buzzer-pin.
+static const int BUZZER_PIN = 4;
+
+AudioPlayer audio;
+
+// ---------------- SERVO CODE DISPLAY ----------------
+// Servo zit op de main-module. Deze toont de 4-cijferige kluiscode
+// die vanuit de GUI binnenkomt met: VAULT:1234
+static const int SERVO_PIN = 26;
+
+Servo codeServo;
+
+// Pulsbreedtes voor MG90S
+static const int SERVO_MIN_US = 500;
+static const int SERVO_MAX_US = 2400;
+
+// Hoeken uit servo_test.ino
+// index 0 hoort bij cijfer 0, index 1 bij cijfer 1, enz.
+static const int SERVO_DIGIT_ANGLES[10] = {
+  161,  // 0
+  150,  // 1
+  136,  // 2
+  122,  // 3
+  103,  // 4
+  83,   // 5
+  60,   // 6
+  45,   // 7
+  32,   // 8
+  17    // 9
+};
+
+static const unsigned long SERVO_WAIT_BETWEEN_DIGITS_MS = 700;
+static const unsigned long SERVO_WAIT_AFTER_CODE_MS = 3000;
+
+String vaultCode = "0000";
+bool vaultCodeReceived = false;
+
+bool servoCodeActive = false;
+int servoCodeIndex = 0;
+unsigned long nextServoMoveMs = 0;
+
+// Wordt true zodra de kluis-oplossing de servo heeft gestart.
+// Hierdoor start de servo niet steeds opnieuw door herhaalde I2C state 2 of audio 11.
+bool vaultServoStarted = false;
+
 
 int currentPuzzle = 0;
 bool running = false;
@@ -77,6 +127,11 @@ const unsigned long WIFI_RETRY_INTERVAL_MS = 5000;
 const unsigned long TCP_RETRY_INTERVAL_MS = 3000;
 const unsigned long ACK_INTERVAL_MS = 5000;
 
+// Na het oplossen van de kluis blijft de kluis-module actief voor knop 1 / solenoid.
+// De main pollt dan alleen nog audio-requests van de kluis, zodat AUDIO_REQ_SOLENOID_OPEN hoorbaar blijft.
+const unsigned long VAULT_AUDIO_POLL_INTERVAL_MS = 80;
+unsigned long lastVaultAudioPollMs = 0;
+
 int loopsend = 0;
 int currentLedStep = 0;
 
@@ -85,6 +140,20 @@ static const int CMD_START_GAME = 100;
 static const int CMD_RESET_GAME = 101;
 static const int CMD_NEXT_PUZZLE = 69;
 static const int CMD_END_GAME = 67;
+
+// Algemeen stopcommando voor alle puzzle-slaves.
+// Als een puzzle wordt geskipt, gereset of handmatig gestopt, stuurt de main dit eerst.
+static const uint8_t CMD_STOP_PUZZLE = 99;
+
+// Prototypes voor functies die eerder in de file worden aangeroepen.
+void sendPuzzleCommand(uint8_t addr, uint8_t cmd, const char* reason);
+void stopPuzzleByIndex(int puzzleIndex, const char* reason);
+void stopAllPuzzles(const char* reason);
+void sendToGui(String msg);
+uint8_t readI2C(uint8_t addr);
+bool handleAudioRequest(uint8_t value, int fromPuzzle);
+void pollVaultAudioAfterComplete();
+void startVaultServoOnce(const char* reason);
 
 struct LedRange
 {
@@ -249,6 +318,179 @@ if (ledIndex < 0 || ledIndex >= LED_COUNT)
   strip.show();
 }
 
+// ---------------- SERVO HELPERS ----------------
+void setupCodeServo()
+{
+  // ESP32Servo gebruikt hardware-timers. Deze allocaties zijn veilig voor normale servo-aansturing.
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+
+  codeServo.setPeriodHertz(50);
+  codeServo.attach(SERVO_PIN, SERVO_MIN_US, SERVO_MAX_US);
+
+  // Rustpositie: cijfer 0.
+  codeServo.write(SERVO_DIGIT_ANGLES[0]);
+
+  Serial.print("Code-servo klaar op GPIO");
+  Serial.println(SERVO_PIN);
+}
+
+void storeVaultCode(const String& code)
+{
+  vaultCode = code;
+  vaultCodeReceived = true;
+
+  Serial.print("Servo-code opgeslagen: ");
+  Serial.println(vaultCode);
+
+  // Als de code gewijzigd wordt terwijl de servo al bezig is,
+  // begin opnieuw bij het eerste cijfer van de nieuwe code.
+  if (servoCodeActive)
+  {
+    servoCodeIndex = 0;
+    nextServoMoveMs = 0;
+    sendToGui("SERVO_CODE_UPDATED:" + vaultCode);
+  }
+}
+
+void stopServoCodeDisplay()
+{
+  servoCodeActive = false;
+  vaultServoStarted = false;
+  servoCodeIndex = 0;
+  nextServoMoveMs = 0;
+
+  // Terug naar rustpositie.
+  codeServo.write(SERVO_DIGIT_ANGLES[0]);
+}
+
+void startServoCodeDisplay()
+{
+  if (!vaultCodeReceived)
+  {
+    Serial.println("Geen VAULT-code ontvangen. Servo toont default code 0000.");
+    vaultCode = "0000";
+  }
+
+  servoCodeActive = true;
+  servoCodeIndex = 0;
+  nextServoMoveMs = 0;
+
+  Serial.print("Servo start met tonen van code: ");
+  Serial.println(vaultCode);
+
+  sendToGui("SERVO_CODE_STARTED:" + vaultCode);
+}
+
+
+void startVaultServoOnce(const char* reason)
+{
+  if (vaultServoStarted)
+    return;
+
+  vaultServoStarted = true;
+
+  Serial.print("Kluis-servo trigger: ");
+  Serial.println(reason);
+
+  startServoCodeDisplay();
+}
+
+void updateServoCodeDisplay()
+{
+  if (!servoCodeActive)
+    return;
+
+  unsigned long now = millis();
+
+  if (nextServoMoveMs != 0 && now < nextServoMoveMs)
+    return;
+
+  if (servoCodeIndex < 0 || servoCodeIndex > 3)
+    servoCodeIndex = 0;
+
+  int digit = vaultCode[servoCodeIndex] - '0';
+
+  if (digit < 0 || digit > 9)
+  {
+    digit = 0;
+  }
+
+  int angle = SERVO_DIGIT_ANGLES[digit];
+  codeServo.write(angle);
+
+  Serial.print("Servo cijfer ");
+  Serial.print(servoCodeIndex + 1);
+  Serial.print(": ");
+  Serial.print(digit);
+  Serial.print(" -> ");
+  Serial.print(angle);
+  Serial.println(" graden");
+
+  servoCodeIndex++;
+
+  if (servoCodeIndex >= 4)
+  {
+    servoCodeIndex = 0;
+    nextServoMoveMs = now + SERVO_WAIT_AFTER_CODE_MS;
+  }
+  else
+  {
+    nextServoMoveMs = now + SERVO_WAIT_BETWEEN_DIGITS_MS;
+  }
+}
+
+// ---------------- AUDIO HELPERS ----------------
+bool handleAudioRequest(uint8_t value, int fromPuzzle)
+{
+  if (!audio.playRequest(value))
+    return false;
+
+  Serial.print("Audio request ontvangen van puzzle ");
+  Serial.print(fromPuzzle);
+  Serial.print(": ");
+  Serial.println(value);
+
+  sendToGui("AUDIO:" + String(value) + ",PUZZLE:" + String(fromPuzzle));
+
+  // Extra robuust voor de kluis:
+  // De kluis zet OPEN en queue't direct AUDIO_REQ_VICTORY.
+  // Als de main eerst die audio-byte 11 leest, starten we de servo meteen.
+  // We hoeven dan niet te wachten tot de volgende poll waarin state 2 terugkomt.
+  if (fromPuzzle == 3 && value == AUDIO_REQ_VICTORY)
+  {
+    startVaultServoOnce("victory audio van kluis");
+  }
+
+  return true;
+}
+
+void pollVaultAudioAfterComplete()
+{
+  if (!allPuzzlesComplete || !puzzleSolved[3])
+    return;
+
+  if (millis() - lastVaultAudioPollMs < VAULT_AUDIO_POLL_INTERVAL_MS)
+    return;
+
+  lastVaultAudioPollMs = millis();
+
+  uint8_t v = readI2C(VAULT_SLAVE_ADDR);
+
+  if (handleAudioRequest(v, 3))
+    return;
+
+  // Extra fallback:
+  // Als de main in COMPLETE-state zit en alsnog state 2 van de kluis ziet,
+  // start de servo alsnog. Dit voorkomt dat de servo uitblijft door timing.
+  if (v == 2)
+  {
+    startVaultServoOnce("kluis state 2 na game complete");
+  }
+}
+
 // ---------------- GENERAL HELPERS ----------------
 String getMacString()
 {
@@ -323,6 +565,11 @@ void sendStateToGui(uint8_t state)
 
 void resetGameState(bool notifyGui)
 {
+  // Belangrijk: eerst alle fysieke puzzelmodules echt uitzetten.
+  // Dit voorkomt dat een oude RUNNING/VICTORY-state blijft hangen na reset.
+  stopAllPuzzles("reset game");
+  audio.stop();
+
   currentPuzzle = 0;
   running = false;
   waitingForStart = true;
@@ -336,6 +583,7 @@ void resetGameState(bool notifyGui)
   }
 
   clearAllLeds();
+  stopServoCodeDisplay();
 
   Serial.println("Game reset -> waiting for start signal");
 
@@ -345,6 +593,11 @@ void resetGameState(bool notifyGui)
 
 void startGame(bool notifyGui)
 {
+  // Nieuwe ronde begint altijd vanaf een schone I2C-state.
+  // Ook als een vorige ronde handmatig is gestopt of geskipt.
+  stopAllPuzzles("start new game");
+  audio.stop();
+
   currentPuzzle = 0;
   running = false;
   waitingForStart = false;
@@ -358,6 +611,7 @@ void startGame(bool notifyGui)
   }
 
   clearAllLeds();
+  stopServoCodeDisplay();
   updatePuzzleLedStrips();
   updateGameTimerStrip(0);
 
@@ -449,6 +703,52 @@ uint8_t readI2C(uint8_t addr)
   return 255;
 }
 
+void sendPuzzleCommand(uint8_t addr, uint8_t cmd, const char* reason)
+{
+  Serial.print("I2C command ");
+  Serial.print(cmd);
+  Serial.print(" naar slave ");
+  Serial.print(addr);
+  Serial.print(" (");
+  Serial.print(reason);
+  Serial.println(")");
+
+  Wire.beginTransmission(addr);
+  Wire.write(cmd);
+  uint8_t err = Wire.endTransmission();
+
+  if (err == 0)
+  {
+    Serial.println("  -> I2C command OK");
+  }
+  else
+  {
+    Serial.print("  -> I2C foutcode: ");
+    Serial.println(err);
+  }
+
+  delay(40);
+}
+
+void stopPuzzleByIndex(int puzzleIndex, const char* reason)
+{
+  if (puzzleIndex < 0 || puzzleIndex >= 4)
+    return;
+
+  sendPuzzleCommand(SLAVES[puzzleIndex], CMD_STOP_PUZZLE, reason);
+}
+
+void stopAllPuzzles(const char* reason)
+{
+  Serial.print("Alle puzzels stoppen: ");
+  Serial.println(reason);
+
+  for (int i = 0; i < 4; i++)
+  {
+    sendPuzzleCommand(SLAVES[i], CMD_STOP_PUZZLE, reason);
+  }
+}
+
 bool isValidVaultCode(const String& code)
 {
   if (code.length() != 4)
@@ -475,8 +775,11 @@ void sendVaultCodeToKluis(const String& code)
   Serial.print("Kluiscode ontvangen: ");
   Serial.println(code);
 
+  // Deze code wordt op de main-module opgeslagen en later door de servo getoond.
+  storeVaultCode(code);
+
   /*
-    Voor nu wordt de code alleen geprint.
+    Voor nu wordt de code alleen op de main-module gebruikt.
     Als de kluis-slave later de code moet ontvangen via I2C,
     kun je hier Wire.beginTransmission(VAULT_SLAVE_ADDR) toevoegen.
   */
@@ -578,10 +881,14 @@ void handleIncomingLine(const String& line)
 
   if (value == CMD_NEXT_PUZZLE)
   {
-    Serial.println("Command 69 -> huidige puzzle completed");
+    Serial.println("Command 69 -> huidige puzzle skip/completed");
 
     if (!waitingForStart && !allPuzzlesComplete)
     {
+      // Eerst de echte slave stoppen, daarna pas intern naar de volgende puzzel.
+      // Hierdoor blijven LEDs, displays, Morse, NeoTrellis, enz. niet actief hangen.
+      stopPuzzleByIndex(currentPuzzle, "skip/current puzzle completed");
+
       if (currentPuzzle >= 0 && currentPuzzle < 4)
         puzzleSolved[currentPuzzle] = true;
 
@@ -605,7 +912,12 @@ void handleIncomingLine(const String& line)
 
   if (value == CMD_END_GAME)
   {
-    Serial.println("Command 67 -> alle puzzles completed");
+    Serial.println("Command 67 -> game handmatig stoppen / alles completed");
+
+    // Handmatige stop: alle fysieke slaves echt terug naar idle.
+    stopAllPuzzles("manual end game");
+    stopServoCodeDisplay();
+    audio.stop();
 
     for (int i = 0; i < 4; i++)
     {
@@ -702,9 +1014,15 @@ void setup()
   Wire.begin(21, 22);
   Wire.setClock(100000);
 
+  // Audio setup
+  audio.begin(BUZZER_PIN);
+
   // WiFi setup
   WiFi.mode(WIFI_STA);
   macString = getMacString();
+
+  // Servo setup
+  setupCodeServo();
 
   resetGameState(false);
 
@@ -714,6 +1032,10 @@ void setup()
 // ---------------- LOOP ----------------
 void loop()
 {
+  // Audio en servo blijven non-blocking doorlopen.
+  audio.update();
+  updateServoCodeDisplay();
+
   connectToWiFiIfNeeded();
 
   if (WiFi.status() == WL_CONNECTED)
@@ -740,6 +1062,10 @@ void loop()
 
   if (waitingForStart || allPuzzlesComplete)
   {
+    // Als de kluis al opgelost is, blijft die module actief in OPEN-fase.
+    // Daardoor kan knop 1 nog steeds de solenoid openen en audio-request 14 sturen.
+    pollVaultAudioAfterComplete();
+
     delay(100);
     return;
   }
@@ -783,17 +1109,62 @@ void loop()
     Serial.print("ACK: ");
     Serial.println(v);
 
+    if (handleAudioRequest(v, currentPuzzle))
+    {
+      // Belangrijk:
+      // Als een puzzel direct na starten al opgelost is, kan de eerste byte
+      // een audio-request zijn, bijvoorbeeld AUDIO_REQ_VICTORY.
+      // Zet running dan alvast true, anders stuurt de main steeds opnieuw
+      // de startcode. Daardoor wordt de softwarepuzzel telkens opnieuw
+      // gestart, blijft hij knipperen en speelt het victory-geluid eindeloos.
+      running = true;
+      delay(80);
+      return;
+    }
+
     sendStateToGui(v);
 
     if (v == 1)
+    {
       running = true;
+    }
+    else if (v == 2)
+    {
+      // Puzzel was al klaar voordat de main in de normale poll-loop kwam.
+      // Handel dit direct hetzelfde af als een normale victory.
+      Serial.println("VICTORY direct na start!");
 
-    delay(300);
+      if (currentPuzzle >= 0 && currentPuzzle < 4)
+        puzzleSolved[currentPuzzle] = true;
+
+      if (currentPuzzle == 3)
+        startVaultServoOnce("kluis direct na start state 2");
+
+      currentPuzzle++;
+      running = false;
+
+      if (currentPuzzle >= 4)
+      {
+        allPuzzlesComplete = true;
+        waitingForStart = true;
+        sendToGui("ALL_PUZZLES_COMPLETE");
+      }
+
+      updatePuzzleLedStrips();
+    }
+
+    delay(200);
     return;
   }
 
   // ---------------- POLL ACTIVE PUZZLE ----------------
   uint8_t v = readI2C(addr);
+
+  if (handleAudioRequest(v, currentPuzzle))
+  {
+    delay(80);
+    return;
+  }
 
   if (v == 1)
   {
@@ -811,6 +1182,11 @@ void loop()
 
     sendStateToGui(2);
 
+    // Als de kluis-puzzel is opgelost, toont de servo de code uit de GUI.
+    // Solenoid wordt in deze versie overgeslagen.
+    if (currentPuzzle == 3)
+      startVaultServoOnce("kluis normale victory state 2");
+
     currentPuzzle++;
     running = false;
 
@@ -824,7 +1200,7 @@ void loop()
 
     updatePuzzleLedStrips();
 
-    delay(1000);
+    delay(150);
     return;
   }
   else
@@ -832,5 +1208,5 @@ void loop()
     sendStateToGui(v);
   }
 
-  delay(400);
+  delay(120);
 }

@@ -11,11 +11,24 @@
 #define I2C_SCL 27
 
 #define CMD_START_SOFTWARE_PUZZLE 48
+#define CMD_STOP_SOFTWARE_PUZZLE 99
 #define CMD_RESET_SOFTWARE_PUZZLE 101
 
 #define STATE_IDLE     0
 #define STATE_RUNNING  1
 #define STATE_VICTORY  2
+
+// Audio request codes voor de main-module
+#define AUDIO_REQ_BUTTON        10
+#define AUDIO_REQ_VICTORY       11
+#define AUDIO_REQ_MORSE_DOT     12
+#define AUDIO_REQ_MORSE_DASH    13
+#define AUDIO_REQ_SOLENOID_OPEN 14
+
+#define AUDIO_QUEUE_SIZE 8
+volatile uint8_t audioQueue[AUDIO_QUEUE_SIZE];
+volatile uint8_t audioHead = 0;
+volatile uint8_t audioTail = 0;
 
 volatile uint8_t responseValue = STATE_IDLE;
 
@@ -126,6 +139,42 @@ void writeLeds(uint16_t value)
 }
 
 // =====================
+// Audio request queue
+// =====================
+
+void queueAudioRequest(uint8_t requestCode)
+{
+  uint8_t nextHead = (audioHead + 1) % AUDIO_QUEUE_SIZE;
+
+  // Queue vol: geluid overslaan, puzzelstatus blijft leidend.
+  if (nextHead == audioTail)
+  {
+    return;
+  }
+
+  audioQueue[audioHead] = requestCode;
+  audioHead = nextHead;
+}
+
+uint8_t getNextAudioOrState(uint8_t normalState)
+{
+  if (audioTail != audioHead)
+  {
+    uint8_t requestCode = audioQueue[audioTail];
+    audioTail = (audioTail + 1) % AUDIO_QUEUE_SIZE;
+    return requestCode;
+  }
+
+  return normalState;
+}
+
+void clearAudioQueue()
+{
+  audioHead = 0;
+  audioTail = 0;
+}
+
+// =====================
 // I2C callbacks
 // =====================
 
@@ -145,15 +194,20 @@ void receiveEvent(int numBytes)
 
     if (cmd == CMD_START_SOFTWARE_PUZZLE)
     {
+      clearAudioQueue();
       startPuzzleRequested = true;
 
       // Direct ACK geven aan main
       responseValue = STATE_RUNNING;
     }
 
-    if (cmd == CMD_RESET_SOFTWARE_PUZZLE)
+    if (cmd == CMD_STOP_SOFTWARE_PUZZLE || cmd == CMD_RESET_SOFTWARE_PUZZLE)
     {
+      clearAudioQueue();
       resetPuzzleRequested = true;
+
+      // Directe ACK: main mag meteen zien dat de slave naar IDLE gaat.
+      responseValue = STATE_IDLE;
     }
   }
 
@@ -162,8 +216,9 @@ void receiveEvent(int numBytes)
 
 void requestEvent()
 {
-  // Main code leest 1 byte, dus stuur 1 byte terug
-  Wire.write(responseValue);
+  // Main code leest 1 byte, dus stuur 1 byte terug.
+  // Audio-requests krijgen voorrang en zijn one-shot.
+  Wire.write(getNextAudioOrState(responseValue));
 }
 
 // =====================
@@ -178,10 +233,15 @@ void resetPuzzle()
   victoryBlinkActive = false;
 
   responseValue = STATE_IDLE;
+  clearAudioQueue();
 
   ledStep = 0;
   effectMode = 0;
   victoryLedState = false;
+  lastLedUpdate = 0;
+  lastPuzzleCheck = 0;
+  lastLedUpdate = 0;
+  lastPuzzleCheck = 0;
 
   for (int i = 0; i < 6; i++)
   {
@@ -201,6 +261,7 @@ void startPuzzle()
   victoryBlinkActive = false;
 
   responseValue = STATE_RUNNING;
+  clearAudioQueue();
 
   ledStep = 0;
   effectMode = 0;
@@ -272,6 +333,8 @@ void checkPuzzle()
   if (allComplete)
   {
     Serial.println("[SOFTWARE PUZZLE] Opgelost, victory blink gestart");
+
+    queueAudioRequest(AUDIO_REQ_VICTORY);
 
     puzzleStarted = false;
 

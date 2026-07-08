@@ -18,12 +18,25 @@
 // Startcommando voor de NeoTrellis-puzzel
 #define CMD_START_NEOTRELLIS 0x2A   // decimaal 42
 #define CMD_STOP_NEOTRELLIS  99
+#define CMD_RESET_NEOTRELLIS 101
 
 /************* STATUSWAARDES *************/
 
 #define STATE_IDLE     0
 #define STATE_RUNNING  1
 #define STATE_VICTORY  2
+
+// Audio request codes voor de main-module
+#define AUDIO_REQ_BUTTON        10
+#define AUDIO_REQ_VICTORY       11
+#define AUDIO_REQ_MORSE_DOT     12
+#define AUDIO_REQ_MORSE_DASH    13
+#define AUDIO_REQ_SOLENOID_OPEN 14
+
+#define AUDIO_QUEUE_SIZE 8
+volatile uint8_t audioQueue[AUDIO_QUEUE_SIZE];
+volatile uint8_t audioHead = 0;
+volatile uint8_t audioTail = 0;
 
 volatile uint8_t responseValue1 = STATE_IDLE;
 volatile uint8_t responseValue2 = 0;
@@ -102,8 +115,41 @@ void victoryFlash();
 
 void onSlaveReceive(int numBytes);
 void onSlaveRequest();
+void queueAudioRequest(uint8_t requestCode);
+uint8_t getNextAudioOrState(uint8_t normalState);
+void clearAudioQueue();
 
 TrellisCallback onButtonPress(keyEvent evt);
+
+/************* AUDIO REQUEST QUEUE *************/
+
+void queueAudioRequest(uint8_t requestCode) {
+  uint8_t nextHead = (audioHead + 1) % AUDIO_QUEUE_SIZE;
+
+  // Als de queue vol is, wordt het nieuwste geluid genegeerd.
+  // Zo blokkeert audio nooit de puzzelstatus.
+  if (nextHead == audioTail) {
+    return;
+  }
+
+  audioQueue[audioHead] = requestCode;
+  audioHead = nextHead;
+}
+
+uint8_t getNextAudioOrState(uint8_t normalState) {
+  if (audioTail != audioHead) {
+    uint8_t requestCode = audioQueue[audioTail];
+    audioTail = (audioTail + 1) % AUDIO_QUEUE_SIZE;
+    return requestCode;
+  }
+
+  return normalState;
+}
+
+void clearAudioQueue() {
+  audioHead = 0;
+  audioTail = 0;
+}
 
 /************* I2C SLAVE RECEIVE CALLBACK *************/
 
@@ -118,13 +164,26 @@ void onSlaveReceive(int numBytes) {
     uint8_t cmd = slaveRxBuffer[0];
 
     if (cmd == CMD_START_NEOTRELLIS) {
+      clearAudioQueue();
+
+      // Start en stop/reset mogen niet tegelijk blijven hangen.
+      stopNeoPuzzleRequested = false;
       startNeoPuzzleRequested = true;
+
       responseValue1 = STATE_RUNNING;
       responseValue2 = 0;
     }
 
-    if (cmd == CMD_STOP_NEOTRELLIS) {
+    if (cmd == CMD_STOP_NEOTRELLIS || cmd == CMD_RESET_NEOTRELLIS) {
+      clearAudioQueue();
+
+      // Reset/stop heeft voorrang op een oude start-request.
+      startNeoPuzzleRequested = false;
       stopNeoPuzzleRequested = true;
+
+      // Directe ACK: main mag meteen zien dat de slave naar IDLE gaat.
+      responseValue1 = STATE_IDLE;
+      responseValue2 = 0;
     }
   }
 
@@ -136,7 +195,7 @@ void onSlaveReceive(int numBytes) {
 void onSlaveRequest() {
   uint8_t tx[2];
 
-  tx[0] = responseValue1;
+  tx[0] = getNextAudioOrState(responseValue1);
   tx[1] = responseValue2;
 
   I2C_SlaveBus.write(tx, 2);
@@ -164,6 +223,8 @@ TrellisCallback onButtonPress(keyEvent evt) {
     Serial.print(" y=");
     Serial.println(y);
 
+    queueAudioRequest(AUDIO_REQ_BUTTON);
+
     // Lights Out werking:
     // knop zelf + boven/onder/links/rechts toggelen
     toggleCell(x, y);
@@ -176,6 +237,8 @@ TrellisCallback onButtonPress(keyEvent evt) {
 
     if (checkWin()) {
       Serial.println("[NEOTRELLIS] Puzzle opgelost!");
+
+      queueAudioRequest(AUDIO_REQ_VICTORY);
 
       responseValue1 = STATE_VICTORY;
       responseValue2 = 0;
@@ -305,16 +368,6 @@ void loop() {
     Serial.println();
   }
 
-  /************* STARTCOMMANDO AFHANDELEN *************/
-
-  if (startNeoPuzzleRequested) {
-    noInterrupts();
-    startNeoPuzzleRequested = false;
-    interrupts();
-
-    startNeoPuzzle();
-  }
-
   /************* STOPCOMMANDO AFHANDELEN *************/
 
   if (stopNeoPuzzleRequested) {
@@ -323,6 +376,16 @@ void loop() {
     interrupts();
 
     stopNeoPuzzle();
+  }
+
+  /************* STARTCOMMANDO AFHANDELEN *************/
+
+  if (startNeoPuzzleRequested) {
+    noInterrupts();
+    startNeoPuzzleRequested = false;
+    interrupts();
+
+    startNeoPuzzle();
   }
 
   /************* TRELLIS KNOPPEN LEZEN *************/
@@ -386,6 +449,8 @@ void startNeoPuzzle() {
     return;
   }
 
+  clearAudioQueue();
+
   loadStartLayout();
   drawBoard();
 
@@ -403,7 +468,11 @@ void stopNeoPuzzle() {
 
   Serial.println("[NEOTRELLIS] Stopcommando ontvangen.");
 
+  startNeoPuzzleRequested = false;
+  stopNeoPuzzleRequested = false;
+
   neoPuzzleActive = false;
+  clearAudioQueue();
 
   clearDisplay();
 

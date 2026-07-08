@@ -6,6 +6,8 @@
 // -------------------------
 #define SLAVE_ADDR 11
 #define START_CODE 60
+#define STOP_CODE 99
+#define RESET_CODE 101
 
 #define SDA_PIN 26
 #define SCL_PIN 27
@@ -13,6 +15,49 @@
 volatile int lastReceived = 0;
 volatile bool puzzleStarted = false;
 volatile bool victory = false;
+volatile bool startPuzzleRequested = false;
+volatile bool stopPuzzleRequested = false;
+
+// -------------------------
+// AUDIO REQUESTS NAAR MAIN
+// -------------------------
+#define AUDIO_REQ_BUTTON        10
+#define AUDIO_REQ_VICTORY       11
+#define AUDIO_REQ_MORSE_DOT     12
+#define AUDIO_REQ_MORSE_DASH    13
+#define AUDIO_REQ_SOLENOID_OPEN 14
+
+#define AUDIO_QUEUE_SIZE 8
+volatile uint8_t audioQueue[AUDIO_QUEUE_SIZE];
+volatile uint8_t audioHead = 0;
+volatile uint8_t audioTail = 0;
+
+void queueAudioRequest(uint8_t requestCode) {
+  uint8_t nextHead = (audioHead + 1) % AUDIO_QUEUE_SIZE;
+
+  // Queue vol: geluid overslaan. De puzzelstatus blijft leidend.
+  if (nextHead == audioTail) {
+    return;
+  }
+
+  audioQueue[audioHead] = requestCode;
+  audioHead = nextHead;
+}
+
+uint8_t getNextAudioOrState(uint8_t normalState) {
+  if (audioTail != audioHead) {
+    uint8_t requestCode = audioQueue[audioTail];
+    audioTail = (audioTail + 1) % AUDIO_QUEUE_SIZE;
+    return requestCode;
+  }
+
+  return normalState;
+}
+
+void clearAudioQueue() {
+  audioHead = 0;
+  audioTail = 0;
+}
 
 // -------------------------
 // PINNEN
@@ -36,14 +81,13 @@ const byte rowPins[4] = {25, 21, 22, 23};
 const byte TM_CLK = 18;
 const byte TM_DIO = 19;
 
-// Volgens jouw schema: Kluis_slot = GPIO33
+// Solenoid-driver zit op de kluis-module.
+// GPIO33 stuurt de driver/MOSFET aan. De solenoid zelf moet via 5V gevoed worden.
 const byte SOLENOID_PIN = 33;
+const unsigned long SOLENOID_OPEN_TIME_MS = 2000;
 
-// Solenoid maximaal 2 seconden open
-const unsigned long SOLENOID_OPEN_TIME = 2000;
-
-bool solenoidActive = false;
-unsigned long solenoidStartTime = 0;
+bool solenoidOpen = false;
+unsigned long solenoidCloseAtMs = 0;
 
 TM1637Display display(TM_CLK, TM_DIO);
 
@@ -91,34 +135,39 @@ char expectedKey = '\0';
 
 bool startMessagePending = false;
 
+
 // -------------------------
-// SOLENOID FUNCTIES
+// SOLENOID
 // -------------------------
-void stopSolenoid() {
+void closeSolenoid() {
   digitalWrite(SOLENOID_PIN, LOW);
-  solenoidActive = false;
+  solenoidOpen = false;
+  solenoidCloseAtMs = 0;
 }
 
-void startSolenoid() {
-  if (solenoidActive) {
+void openSolenoid() {
+  if (solenoidOpen) {
     return;
   }
 
   digitalWrite(SOLENOID_PIN, HIGH);
-  solenoidActive = true;
-  solenoidStartTime = millis();
+  solenoidOpen = true;
+  solenoidCloseAtMs = millis() + SOLENOID_OPEN_TIME_MS;
 
-  Serial.println("Solenoid AAN. Kluis open voor maximaal 2 seconden.");
+  queueAudioRequest(AUDIO_REQ_SOLENOID_OPEN);
+
+  Serial.println("Solenoid open via GPIO33. Audio-request 14 naar main-module.");
 }
 
 void updateSolenoid() {
-  if (!solenoidActive) {
+  if (!solenoidOpen) {
     return;
   }
 
-  if (millis() - solenoidStartTime >= SOLENOID_OPEN_TIME) {
-    stopSolenoid();
-    Serial.println("Solenoid UIT. Kluis weer dicht.");
+  // Cast naar signed long voorkomt problemen rond millis-overflow.
+  if ((long)(millis() - solenoidCloseAtMs) >= 0) {
+    closeSolenoid();
+    Serial.println("Solenoid automatisch gesloten.");
   }
 }
 
@@ -237,6 +286,11 @@ char waitForStableKeypress() {
 void waitUntilReleased() {
   while (readKeypadOnce() != '\0') {
     updateSolenoid();
+
+    if (stopPuzzleRequested || !puzzleStarted) {
+      break;
+    }
+
     delay(10);
   }
 }
@@ -276,20 +330,24 @@ void resetToLevel1() {
   generateNewChallenge();
 }
 
+void finishPuzzle() {
+  gameFinished = true;
+  victory = true;
+
+  showOpen();
+  queueAudioRequest(AUDIO_REQ_VICTORY);
+
+  Serial.println("Laatste level gehaald.");
+  Serial.println("Kluis opgelost: display toont OPEN.");
+  Serial.println("I2C-status is nu 2. Main-module kan nu de servo-code starten.");
+}
+
 void handleCorrect() {
   showGood();
   delay(500);
 
   if (level >= MAX_LEVEL) {
-    gameFinished = true;
-    victory = true;
-
-    stopSolenoid();
-    showOpen();
-
-    Serial.println("Laatste level gehaald.");
-    Serial.println("Display toont OPEN.");
-    Serial.println("Druk op knop 1 om de solenoid maximaal 2 seconden te openen.");
+    finishPuzzle();
   } else {
     level++;
     generateNewChallenge();
@@ -297,7 +355,11 @@ void handleCorrect() {
 }
 
 void handleKey(char pressedKey) {
-  if (gameFinished) return;
+  queueAudioRequest(AUDIO_REQ_BUTTON);
+
+  if (gameFinished) {
+    return;
+  }
 
   Serial.print("Gedrukt: ");
   Serial.print(pressedKey);
@@ -312,26 +374,24 @@ void handleKey(char pressedKey) {
   }
 }
 
-// -------------------------
-// EINDSTATUS
-// -------------------------
-void handleFinishedKeypad() {
-  char key = waitForStableKeypress();
+void stopPuzzle() {
+  closeSolenoid();
 
-  if (key != '\0') {
-    Serial.print("Eindstatus toets gedrukt: ");
-    Serial.println(key);
+  puzzleStarted = false;
+  victory = false;
+  gameFinished = false;
+  level = 1;
+  expectedKey = '\0';
+  startMessagePending = false;
+  clearAudioQueue();
 
-    // AANGEPAST:
-    // Eerst was dit key == '0'.
-    // Nu opent knop 1 de solenoid.
-    if (key == '1') {
-      startSolenoid();
-    }
-
-    waitUntilReleased();
-    delay(50);
+  for (byte r = 0; r < 4; r++) {
+    digitalWrite(rowPins[r], LOW);
   }
+
+  showWaiting();
+
+  Serial.println("Kluisslave gestopt/reset naar IDLE.");
 }
 
 // -------------------------
@@ -342,28 +402,36 @@ void receiveEvent(int bytes) {
     lastReceived = Wire.read();
 
     if (lastReceived == START_CODE) {
+      clearAudioQueue();
+      // Direct ACK naar main: puzzle gaat RUNNING worden.
       puzzleStarted = true;
       victory = false;
-      gameFinished = false;
-      level = 1;
-
-      stopSolenoid();
-
-      startMessagePending = true;
+      startPuzzleRequested = true;
+    }
+    else if (lastReceived == STOP_CODE || lastReceived == RESET_CODE) {
+      clearAudioQueue();
+      // Direct ACK naar main: puzzle gaat IDLE worden.
+      puzzleStarted = false;
+      victory = false;
+      stopPuzzleRequested = true;
     }
   }
 }
 
 void requestEvent() {
+  uint8_t normalState;
+
   if (!puzzleStarted) {
-    Wire.write(0);   // not started
+    normalState = 0;   // not started / idle
   }
   else if (victory) {
-    Wire.write(2);   // victory
+    normalState = 2;   // victory: main moet servo starten
   }
   else {
-    Wire.write(1);   // running
+    normalState = 1;   // running
   }
+
+  Wire.write(getNextAudioOrState(normalState));
 }
 
 // -------------------------
@@ -381,15 +449,14 @@ void setup() {
     pinMode(colPins[c], INPUT);
   }
 
-  // Rijen zijn outputs.
-  // Normaal LOW.
+  // Rijen zijn outputs. Normaal LOW.
   for (byte r = 0; r < 4; r++) {
     pinMode(rowPins[r], OUTPUT);
     digitalWrite(rowPins[r], LOW);
   }
 
   pinMode(SOLENOID_PIN, OUTPUT);
-  digitalWrite(SOLENOID_PIN, LOW);
+  closeSolenoid();
 
   showWaiting();
 
@@ -399,7 +466,7 @@ void setup() {
 
   randomSeed(micros());
 
-  Serial.println("SLAVE READY");
+  Serial.println("KLUIS SLAVE READY");
   Serial.println("Wacht op startcode...");
 }
 
@@ -409,13 +476,29 @@ void setup() {
 void loop() {
   updateSolenoid();
 
-  if (startMessagePending) {
+  if (stopPuzzleRequested) {
+    noInterrupts();
+    stopPuzzleRequested = false;
+    interrupts();
+
+    stopPuzzle();
+  }
+
+  if (startPuzzleRequested || startMessagePending) {
+    noInterrupts();
+    startPuzzleRequested = false;
+    interrupts();
+
     startMessagePending = false;
 
-    Serial.println("START RECEIVED");
-    Serial.println("Start spel.");
+    puzzleStarted = true;
+    victory = false;
+    gameFinished = false;
+    level = 1;
 
-    stopSolenoid();
+    Serial.println("START RECEIVED");
+    Serial.println("Start kluis-puzzel.");
+
     generateNewChallenge();
   }
 
@@ -424,10 +507,20 @@ void loop() {
     return;
   }
 
+  // Na 5 goede knoppen blijft de kluis actief in OPEN-fase.
+  // De I2C-status blijft 2, zodat de main-module de servo kan starten.
+  // Knop 1 opent nu lokaal de solenoid via GPIO33 en stuurt audio-request 14 naar de main.
   if (gameFinished) {
     showOpen();
-    handleFinishedKeypad();
-    delay(20);
+
+    char openKey = waitForStableKeypress();
+
+    if (openKey == '1') {
+      openSolenoid();
+      waitUntilReleased();
+    }
+
+    delay(50);
     return;
   }
 

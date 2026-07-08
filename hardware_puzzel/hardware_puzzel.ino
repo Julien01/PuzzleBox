@@ -1,5 +1,6 @@
 #include <Wire.h>
 #include <TM1637Display.h>
+#include <esp_system.h>
 
 // =====================
 // I2C
@@ -12,11 +13,24 @@
 #define I2C_SCL 27
 
 #define CMD_START_HARDWARE_PUZZLE 54
+#define CMD_STOP_HARDWARE_PUZZLE 99
 #define CMD_RESET_HARDWARE_PUZZLE 101
 
 #define STATE_IDLE     0
 #define STATE_RUNNING  1
 #define STATE_VICTORY  2
+
+// Audio request codes voor de main-module
+#define AUDIO_REQ_BUTTON        10
+#define AUDIO_REQ_VICTORY       11
+#define AUDIO_REQ_MORSE_DOT     12
+#define AUDIO_REQ_MORSE_DASH    13
+#define AUDIO_REQ_SOLENOID_OPEN 14
+
+#define AUDIO_QUEUE_SIZE 16
+volatile uint8_t audioQueue[AUDIO_QUEUE_SIZE];
+volatile uint8_t audioHead = 0;
+volatile uint8_t audioTail = 0;
 
 volatile uint8_t responseValue = STATE_IDLE;
 
@@ -35,10 +49,16 @@ volatile int lastReceived = 0;
 
 void handleSerialInput();
 
+void queueAudioRequest(uint8_t requestCode);
+uint8_t getNextAudioOrState(uint8_t normalState);
+void clearAudioQueue();
+
 void resetPuzzle();
 void startPuzzle();
 
+bool switchInputIsUsed(int index);
 bool boolPuzzleCorrect();
+void generateRandomCorrectCode();
 
 void resetPlayerCode();
 void updatePlayerCodeFromPots();
@@ -65,6 +85,22 @@ const int boolPins[8] = {
   33, 32, 35, 34, 25, 23, 22, 21
 };
 
+// Switch 1 en 2 worden bewust genegeerd.
+// index 0 = switch 1 = GPIO33
+// index 1 = switch 2 = GPIO32
+// true  = deze switch telt mee
+// false = deze switch wordt niet gelezen en heeft geen invloed op fase 1
+const bool useBoolSwitch[8] = {
+  false,  // switch 1 / GPIO33 genegeerd
+  false,  // switch 2 / GPIO32 genegeerd
+  true,   // switch 3 / GPIO35
+  true,   // switch 4 / GPIO34
+  true,   // switch 5 / GPIO25
+  true,   // switch 6 / GPIO23
+  true,   // switch 7 / GPIO22
+  true    // switch 8 / GPIO21
+};
+
 // GPIO36 = waarde kiezen van 0 t/m 9
 // GPIO37 = actief cijfer kiezen van 1 t/m 4
 const int potValuePin  = 36;
@@ -87,27 +123,31 @@ TM1637Display display(displayClkPin, displayDataPin);
 // false = verwachte input is LOW
 //
 // Deze array verandert alleen wat de verwachte switchstand is.
-// De pinMode blijft altijd INPUT.
+// Switch 1 en 2 worden niet gebruikt door boolPuzzleCorrect().
 //
 
 bool correctBoolState[8] = {
-  true,   // GPIO 33
-  false,   // GPIO 32
-  false,  // GPIO 35
-  false,  // GPIO 34
-  true,   // GPIO 25
-  false,  // GPIO 23
-  false,  // GPIO 22
-  true    // GPIO 21
+  true,   // switch 1 / GPIO33 -> genegeerd
+  false,  // switch 2 / GPIO32 -> genegeerd
+  false,  // switch 3 / GPIO35
+  false,  // switch 4 / GPIO34
+  true,   // switch 5 / GPIO25
+  false,  // switch 6 / GPIO23
+  false,  // switch 7 / GPIO22
+  true    // switch 8 / GPIO21
 };
 
 // =====================
-// Fixed potmeter / Morse code
+// Random potmeter / Morse code
 // =====================
 
-// Code is altijd 5213
+// Deze code wordt bij elke start opnieuw random gemaakt.
+// Dezelfde code wordt gebruikt voor:
+// - Morse LED
+// - Morse audio
+// - juiste potmeter-code
 int correctCode[4] = {
-  5, 2, 1, 3
+  0, 0, 0, 0
 };
 
 // Door speler ingestelde code
@@ -188,6 +228,37 @@ const unsigned long debugInterval = 1000;
 bool previousSwitchesCorrect = false;
 
 // =====================
+// Audio request queue
+// =====================
+
+void queueAudioRequest(uint8_t requestCode) {
+  uint8_t nextHead = (audioHead + 1) % AUDIO_QUEUE_SIZE;
+
+  // Queue vol: geluid overslaan. Puzzelstatus blijft belangrijker.
+  if (nextHead == audioTail) {
+    return;
+  }
+
+  audioQueue[audioHead] = requestCode;
+  audioHead = nextHead;
+}
+
+uint8_t getNextAudioOrState(uint8_t normalState) {
+  if (audioTail != audioHead) {
+    uint8_t requestCode = audioQueue[audioTail];
+    audioTail = (audioTail + 1) % AUDIO_QUEUE_SIZE;
+    return requestCode;
+  }
+
+  return normalState;
+}
+
+void clearAudioQueue() {
+  audioHead = 0;
+  audioTail = 0;
+}
+
+// =====================
 // I2C events
 // =====================
 
@@ -204,13 +275,15 @@ void receiveEvent(int bytes) {
     lastReceived = cmd;
 
     if (cmd == CMD_START_HARDWARE_PUZZLE) {
+      clearAudioQueue();
       startPuzzleRequested = true;
 
       // Direct ACK naar main-controller
       responseValue = STATE_RUNNING;
     }
 
-    if (cmd == CMD_RESET_HARDWARE_PUZZLE) {
+    if (cmd == CMD_STOP_HARDWARE_PUZZLE || cmd == CMD_RESET_HARDWARE_PUZZLE) {
+      clearAudioQueue();
       resetPuzzleRequested = true;
 
       // Direct terug naar idle
@@ -222,11 +295,9 @@ void receiveEvent(int bytes) {
 }
 
 void requestEvent() {
-  // Main leest 1 byte:
-  // 0 = idle
-  // 1 = running
-  // 2 = victory
-  Wire.write(responseValue);
+  // Main leest 1 byte.
+  // Audio-requests krijgen voorrang en zijn one-shot.
+  Wire.write(getNextAudioOrState(responseValue));
 }
 
 // =====================
@@ -240,6 +311,7 @@ void resetPuzzle() {
   victoryBlinkActive = false;
 
   responseValue = STATE_IDLE;
+  clearAudioQueue();
 
   stopMorseCode();
   resetPlayerCode();
@@ -247,6 +319,8 @@ void resetPuzzle() {
   digitalWrite(morseLedPin, LOW);
   display.clear();
 
+  lastDisplayUpdate = 0;
+  lastDebugPrint = 0;
   previousSwitchesCorrect = false;
 
   Serial.println("[HARDWARE PUZZLE] Reset naar IDLE");
@@ -260,6 +334,9 @@ void startPuzzle() {
   victoryBlinkActive = false;
 
   responseValue = STATE_RUNNING;
+  clearAudioQueue();
+
+  generateRandomCorrectCode();
 
   stopMorseCode();
   resetPlayerCode();
@@ -267,6 +344,8 @@ void startPuzzle() {
   digitalWrite(morseLedPin, LOW);
   display.clear();
 
+  lastDisplayUpdate = 0;
+  lastDebugPrint = 0;
   previousSwitchesCorrect = false;
 
   Serial.println("[HARDWARE PUZZLE] Puzzle gestart door I2C startcode 54");
@@ -282,12 +361,21 @@ void printPuzzleSetup() {
 
   Serial.println("[SETUP] Correct switch states:");
   Serial.println("[SETUP] true = expected HIGH, false = expected LOW");
+  Serial.println("[SETUP] switch 1 en 2 worden genegeerd");
 
   for (int i = 0; i < 8; i++) {
-    Serial.print("  boolPins[");
+    Serial.print("  switch ");
+    Serial.print(i + 1);
+    Serial.print(" / boolPins[");
     Serial.print(i);
     Serial.print("] GPIO ");
     Serial.print(boolPins[i]);
+
+    if (!switchInputIsUsed(i)) {
+      Serial.println(" -> IGNORED");
+      continue;
+    }
+
     Serial.print(" expected ");
 
     if (correctBoolState[i]) {
@@ -299,11 +387,7 @@ void printPuzzleSetup() {
 
   Serial.println();
 
-  Serial.print("[SETUP] Correct pot/Morse code: ");
-  for (int i = 0; i < 4; i++) {
-    Serial.print(correctCode[i]);
-  }
-  Serial.println();
+  Serial.println("[SETUP] Pot/Morse code wordt random gemaakt bij elke start.");
 
   Serial.println("[SETUP] Potmeter input:");
   Serial.println("  GPIO36 = waarde 0-9");
@@ -368,9 +452,17 @@ void setup() {
   pinMode(morseLedPin, OUTPUT);
   digitalWrite(morseLedPin, LOW);
 
-  // Alle switches zijn gewone inputs.
+  // Alle actieve switches zijn gewone inputs.
   // Geen INPUT_PULLUP of INPUT_PULLDOWN.
+  // Switch 1 en 2 worden bewust niet gelezen.
   for (int i = 0; i < 8; i++) {
+    if (!switchInputIsUsed(i)) {
+      Serial.print("[PINMODE] GPIO ");
+      Serial.print(boolPins[i]);
+      Serial.println(" ignored, not read");
+      continue;
+    }
+
     pinMode(boolPins[i], INPUT);
 
     Serial.print("[PINMODE] GPIO ");
@@ -384,6 +476,8 @@ void setup() {
   analogReadResolution(12);
   analogSetPinAttenuation(potValuePin, ADC_11db);
   analogSetPinAttenuation(potSelectPin, ADC_11db);
+
+  randomSeed(esp_random());
 
   display.setBrightness(7);
   display.clear();
@@ -424,6 +518,14 @@ void setup() {
 // Switch input reading
 // =====================
 
+bool switchInputIsUsed(int index) {
+  if (index < 0 || index >= 8) {
+    return false;
+  }
+
+  return useBoolSwitch[index];
+}
+
 bool readBoolPin(int index) {
   int state = digitalRead(boolPins[index]);
 
@@ -435,6 +537,10 @@ bool readBoolPin(int index) {
 
 bool boolPuzzleCorrect() {
   for (int i = 0; i < 8; i++) {
+    if (!switchInputIsUsed(i)) {
+      continue;
+    }
+
     bool currentState = readBoolPin(i);
 
     if (currentState != correctBoolState[i]) {
@@ -573,6 +679,20 @@ int correctCodeAsNumber() {
          correctCode[3];
 }
 
+void generateRandomCorrectCode() {
+  for (int i = 0; i < 4; i++) {
+    correctCode[i] = random(0, 10);
+  }
+
+  Serial.print("[RANDOM CODE] Nieuwe Morse/potmeter-code: ");
+
+  for (int i = 0; i < 4; i++) {
+    Serial.print(correctCode[i]);
+  }
+
+  Serial.println();
+}
+
 // =====================
 // Serial input
 // =====================
@@ -615,7 +735,9 @@ void handleSerialInput() {
   }
 
   if (input == "MORSETEST") {
-    Serial.println("[MORSETEST] Starting Morse 5213 without switch check.");
+    Serial.println("[MORSETEST] Starting random Morse without switch check.");
+
+    generateRandomCorrectCode();
 
     victory = false;
     puzzleFinished = false;
@@ -623,6 +745,7 @@ void handleSerialInput() {
     puzzleStarted = true;
     responseValue = STATE_RUNNING;
 
+    clearAudioQueue();
     stopMorseCode();
     startMorseCode();
     return;
@@ -644,13 +767,20 @@ void printBoolDebug() {
   Serial.println("[SWITCH INPUTS]");
 
   for (int i = 0; i < 8; i++) {
-    bool currentState = readBoolPin(i);
-    int rawState = digitalRead(boolPins[i]);
-
-    Serial.print("  boolPins[");
+    Serial.print("  switch ");
+    Serial.print(i + 1);
+    Serial.print(" / boolPins[");
     Serial.print(i);
     Serial.print("] GPIO ");
     Serial.print(boolPins[i]);
+
+    if (!switchInputIsUsed(i)) {
+      Serial.println(" | IGNORED / not read");
+      continue;
+    }
+
+    bool currentState = readBoolPin(i);
+    int rawState = digitalRead(boolPins[i]);
 
     Serial.print(" raw=");
     Serial.print(rawState == HIGH ? "HIGH" : "LOW");
@@ -711,7 +841,11 @@ void printCorrectCodeDebug() {
   Serial.print("[SOLUTION] Switch states: ");
 
   for (int i = 0; i < 8; i++) {
-    Serial.print(correctBoolState[i] ? "1" : "0");
+    if (!switchInputIsUsed(i)) {
+      Serial.print("x");
+    } else {
+      Serial.print(correctBoolState[i] ? "1" : "0");
+    }
   }
 
   Serial.print(" | Pot/Morse code: ");
@@ -803,7 +937,11 @@ void printGeneralDebug() {
     Serial.println("[STATUS] Waiting for correct switch combination.");
   }
   else if (!potentiometerCodeCorrect()) {
-    Serial.println("[STATUS] Switches correct. Set player code to 5213.");
+    Serial.print("[STATUS] Switches correct. Set player code to ");
+    for (int i = 0; i < 4; i++) {
+      Serial.print(correctCode[i]);
+    }
+    Serial.println(".");
   }
   else {
     Serial.println("[STATUS] Puzzle should now complete.");
@@ -903,8 +1041,10 @@ void updateMorse() {
 
       if (currentSymbol == '.') {
         morseCurrentDuration = dotTime;
+        queueAudioRequest(AUDIO_REQ_MORSE_DOT);
       } else {
         morseCurrentDuration = dashTime;
+        queueAudioRequest(AUDIO_REQ_MORSE_DASH);
       }
 
       morseNextChangeTime = now + morseCurrentDuration;
@@ -961,10 +1101,17 @@ void updateMorse() {
 void startVictoryBlink() {
   Serial.println();
   Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-  Serial.println("VICTORY! Correct switches + player code 5213.");
+  Serial.print("VICTORY! Correct switches + player code ");
+
+  for (int i = 0; i < 4; i++) {
+    Serial.print(correctCode[i]);
+  }
+
+  Serial.println(".");
   Serial.println("Starting 7-segment victory blink.");
   Serial.println("During blink: I2C returns RUNNING.");
   Serial.println("After blink: I2C returns VICTORY.");
+  Serial.println("Victory audio request blijft in de queue staan.");
   Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
 
   // Tijdens flikkeren blijft de main-controller nog RUNNING lezen.
@@ -973,6 +1120,12 @@ void startVictoryBlink() {
   puzzleFinished = false;
 
   responseValue = STATE_RUNNING;
+
+  // Oude Morse dot/dash requests verwijderen, daarna victory sound aanvragen.
+  // In de vorige versie werd de queue ná het toevoegen geleegd,
+  // waardoor victory-audio soms nooit bij de main kwam.
+  clearAudioQueue();
+  queueAudioRequest(AUDIO_REQ_VICTORY);
 
   stopMorseCode();
   digitalWrite(morseLedPin, LOW);
@@ -1158,7 +1311,7 @@ void loop() {
   // GPIO37 kiest actieve positie 1-4.
   // Display toont speler-code.
   // Actieve positie knippert.
-  // LED knippert Morse voor code 5213.
+  // LED en audio geven Morse voor de random code.
   startMorseCode();
   updateMorse();
 
